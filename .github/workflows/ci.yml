@@ -1,0 +1,42 @@
+name: Go CI
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.21'
+        cache: true
+    
+    - name: Download dependencies
+      run: go mod download
+    
+    - name: Build
+      run: go build -v ./...
+    
+    - name: Run tests
+      run: go test -v -race -coverprofile=coverage.txt -covermode=atomic ./...
+    
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v4
+      continue-on-error: true
+      with:
+        file: ./coverage.txt
+        flags: unittests
+    
+    - name: Build Docker image
+      if: github.event_name == 'push'
+      run: docker build -t ghcr.io/agenthub-studio/${{ github.event.repository.name }}:${{ github.sha }} .
+      continue-on-error: true
