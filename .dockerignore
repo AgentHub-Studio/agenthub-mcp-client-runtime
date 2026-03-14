@@ -1,0 +1,26 @@
+# Arquivos de desenvolvimento
+.git
+.gitignore
+.vscode
+.idea
+
+# Binários e builds
+bin/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Testes
+*_test.go
+coverage.txt
+coverage.html
+
+# Documentação
+README.md
+docs/
+
+# Arquivos temporários
+*.tmp
+*.log
+.DS_Store
