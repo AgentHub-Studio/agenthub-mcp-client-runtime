@@ -1,0 +1,149 @@
+syntax = "proto3";
+
+package mcpclient;
+
+option go_package = "github.com/agenthub/mcp-client-runtime/proto";
+option java_package = "dev.cezar.agenthub.mcp.client";
+option java_outer_classname = "MCPClientProto";
+
+// Serviço MCP Client
+service MCPClientService {
+  // Descobrir capabilities de um servidor MCP
+  rpc DiscoverCapabilities(DiscoverRequest) returns (DiscoverResponse);
+  
+  // Executar um tool
+  rpc ExecuteTool(ExecuteToolRequest) returns (ExecuteToolResponse);
+  
+  // Executar um prompt
+  rpc ExecutePrompt(ExecutePromptRequest) returns (ExecutePromptResponse);
+  
+  // Ler um resource
+  rpc ReadResource(ReadResourceRequest) returns (ReadResourceResponse);
+  
+  // Listar servidores MCP conectados
+  rpc ListServers(ListServersRequest) returns (ListServersResponse);
+  
+  // Registrar novo servidor MCP
+  rpc RegisterServer(RegisterServerRequest) returns (RegisterServerResponse);
+}
+
+// ========== Discovery ==========
+
+message DiscoverRequest {
+  string server_name = 1;  // Nome do servidor MCP (ex: "filesystem")
+}
+
+message DiscoverResponse {
+  repeated Tool tools = 1;
+  repeated Prompt prompts = 2;
+  repeated Resource resources = 3;
+  ServerInfo server_info = 4;
+}
+
+message Tool {
+  string name = 1;
+  string description = 2;
+  map<string, string> parameters = 3;  // JSON Schema serializado
+}
+
+message Prompt {
+  string name = 1;
+  string description = 2;
+  repeated PromptArgument arguments = 3;
+}
+
+message PromptArgument {
+  string name = 1;
+  string description = 2;
+  bool required = 3;
+}
+
+message Resource {
+  string uri = 1;
+  string name = 2;
+  string description = 3;
+  string mime_type = 4;
+}
+
+message ServerInfo {
+  string name = 1;
+  string version = 2;
+  string protocol_version = 3;
+}
+
+// ========== Execution ==========
+
+message ExecuteToolRequest {
+  string server_name = 1;
+  string tool_name = 2;
+  map<string, string> parameters = 3;  // JSON values serializados como string
+  int32 timeout_ms = 4;  // Timeout em milissegundos (0 = default)
+}
+
+message ExecuteToolResponse {
+  bool success = 1;
+  string result = 2;  // JSON serializado
+  string error = 3;   // Mensagem de erro, se houver
+  int32 duration_ms = 4;
+}
+
+message ExecutePromptRequest {
+  string server_name = 1;
+  string prompt_name = 2;
+  map<string, string> arguments = 3;
+  int32 timeout_ms = 4;
+}
+
+message ExecutePromptResponse {
+  bool success = 1;
+  string result = 2;  // Prompt renderizado
+  string error = 3;
+  int32 duration_ms = 4;
+}
+
+message ReadResourceRequest {
+  string server_name = 1;
+  string resource_uri = 2;
+  int32 timeout_ms = 3;
+}
+
+message ReadResourceResponse {
+  bool success = 1;
+  string content = 2;
+  string mime_type = 3;
+  string error = 4;
+  int32 size_bytes = 5;
+}
+
+// ========== Server Management ==========
+
+message ListServersRequest {
+  // Vazio - lista todos os servidores
+}
+
+message ListServersResponse {
+  repeated MCPServer servers = 1;
+}
+
+message MCPServer {
+  string name = 1;
+  string command = 2;
+  repeated string args = 3;
+  map<string, string> env = 4;
+  string status = 5;  // "running", "stopped", "error"
+  int64 started_at = 6;  // Unix timestamp
+}
+
+message RegisterServerRequest {
+  string name = 1;
+  string command = 2;
+  repeated string args = 3;
+  map<string, string> env = 4;
+  bool auto_start = 5;  // Iniciar automaticamente
+}
+
+message RegisterServerResponse {
+  bool success = 1;
+  string error = 2;
+  MCPServer server = 3;
+}
