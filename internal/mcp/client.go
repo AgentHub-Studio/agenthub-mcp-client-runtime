@@ -25,12 +25,21 @@ type Client struct {
 	startedAt  time.Time
 }
 
-// ClientConfig holds configuration for creating an MCP client
+// ClientConfig holds configuration for creating an MCP client.
 type ClientConfig struct {
-	Name    string
+	Name string
+
+	// Stdio transport fields (TransportType = "stdio", default)
 	Command string
 	Args    []string
 	Env     []string
+
+	// HTTP transport fields (TransportType = "http")
+	TransportType string // "stdio" (default) or "http"
+	HTTPBaseURL   string
+
+	// Optional OAuth provider for the HTTP transport
+	OAuthProvider OAuthTokenProvider
 }
 
 // NewClient creates a new MCP client
@@ -140,6 +149,17 @@ func (c *Client) IsRunning() bool {
 	return c.isRunning
 }
 
+// GetConfig returns the configuration used to create this client.
+func (c *Client) GetConfig() ClientConfig {
+	return ClientConfig{
+		Name:          c.name,
+		Command:       c.command,
+		Args:          c.args,
+		Env:           c.env,
+		TransportType: "stdio",
+	}
+}
+
 // GetServerInfo returns information about the connected MCP server
 func (c *Client) GetServerInfo() *ServerInfo {
 	c.mu.RLock()
@@ -150,7 +170,7 @@ func (c *Client) GetServerInfo() *ServerInfo {
 // initialize performs MCP initialization handshake
 func (c *Client) initialize(ctx context.Context) error {
 	params := InitializeParams{
-		ProtocolVersion: "2024-11-05",
+		ProtocolVersion: ProtocolVersion,
 		Capabilities:    map[string]interface{}{},
 		ClientInfo: ClientInfo{
 			Name:    "agenthub-mcp-client",

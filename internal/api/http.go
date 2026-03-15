@@ -6,6 +6,7 @@ import (
 	"net/http"
 
 	"github.com/agenthub/mcp-client-runtime/internal/mcp"
+	"github.com/agenthub/mcp-client-runtime/internal/oauth"
 	"github.com/gin-gonic/gin"
 )
 
@@ -75,12 +76,26 @@ func (s *HTTPServer) handleListServers(c *gin.Context) {
 	})
 }
 
+// RegisterServerRequest holds the payload for registering an MCP server.
+// Supports both stdio transport (Command) and Streamable HTTP transport (TransportType + HTTPBaseURL).
 type RegisterServerRequest struct {
 	Name      string            `json:"name" binding:"required"`
-	Command   string            `json:"command" binding:"required"`
-	Args      []string          `json:"args"`
-	Env       map[string]string `json:"env"`
 	AutoStart bool              `json:"autoStart"`
+
+	// Stdio transport (default when TransportType is empty or "stdio")
+	Command string            `json:"command"`
+	Args    []string          `json:"args"`
+	Env     map[string]string `json:"env"`
+
+	// HTTP transport (TransportType = "http")
+	TransportType string `json:"transportType"` // "stdio" or "http"
+	HTTPBaseURL   string `json:"httpBaseUrl"`
+
+	// OAuth 2.1 Client Credentials (optional, for protected HTTP servers)
+	OAuthTokenURL     string   `json:"oauthTokenUrl"`
+	OAuthClientID     string   `json:"oauthClientId"`
+	OAuthClientSecret string   `json:"oauthClientSecret"`
+	OAuthScopes       []string `json:"oauthScopes"`
 }
 
 func (s *HTTPServer) handleRegisterServer(c *gin.Context) {
@@ -90,17 +105,35 @@ func (s *HTTPServer) handleRegisterServer(c *gin.Context) {
 		return
 	}
 
-	// Convert env map to array
+	// Convert env map to slice
 	env := make([]string, 0, len(req.Env))
 	for k, v := range req.Env {
 		env = append(env, fmt.Sprintf("%s=%s", k, v))
 	}
 
 	config := mcp.ClientConfig{
-		Name:    req.Name,
-		Command: req.Command,
-		Args:    req.Args,
-		Env:     env,
+		Name:          req.Name,
+		Command:       req.Command,
+		Args:          req.Args,
+		Env:           env,
+		TransportType: req.TransportType,
+		HTTPBaseURL:   req.HTTPBaseURL,
+	}
+
+	// Build OAuth provider when credentials are supplied for HTTP transport
+	if req.TransportType == "http" && req.OAuthTokenURL != "" {
+		tokenClient, err := oauth.NewTokenClient(
+			context.Background(),
+			req.OAuthTokenURL,
+			req.OAuthClientID,
+			req.OAuthClientSecret,
+			req.OAuthScopes,
+		)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("erro ao configurar OAuth: %v", err)})
+			return
+		}
+		config.OAuthProvider = tokenClient
 	}
 
 	if err := s.mcpManager.RegisterServer(config); err != nil {

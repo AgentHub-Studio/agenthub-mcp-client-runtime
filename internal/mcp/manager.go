@@ -7,20 +7,36 @@ import (
 	"time"
 )
 
-// Manager manages multiple MCP clients
+// ClientIface is the common interface implemented by both stdio and HTTP MCP clients.
+type ClientIface interface {
+	Start(ctx context.Context) error
+	Stop() error
+	IsRunning() bool
+	GetServerInfo() *ServerInfo
+	GetConfig() ClientConfig
+	ListTools(ctx context.Context) (*ListToolsResult, error)
+	CallTool(ctx context.Context, name string, arguments map[string]interface{}) (*CallToolResult, error)
+	ListPrompts(ctx context.Context) (*ListPromptsResult, error)
+	GetPrompt(ctx context.Context, name string, arguments map[string]interface{}) (*GetPromptResult, error)
+	ListResources(ctx context.Context) (*ListResourcesResult, error)
+	ReadResource(ctx context.Context, uri string) (*ReadResourceResult, error)
+}
+
+// Manager manages multiple MCP clients (stdio or HTTP transport).
 type Manager struct {
-	clients map[string]*Client
+	clients map[string]ClientIface
 	mu      sync.RWMutex
 }
 
-// NewManager creates a new MCP client manager
+// NewManager creates a new MCP client manager.
 func NewManager() *Manager {
 	return &Manager{
-		clients: make(map[string]*Client),
+		clients: make(map[string]ClientIface),
 	}
 }
 
-// RegisterServer registers a new MCP server
+// RegisterServer registers a new MCP server.
+// Creates an HTTPClient when config.TransportType == "http", otherwise a stdio Client.
 func (m *Manager) RegisterServer(config ClientConfig) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -29,13 +45,21 @@ func (m *Manager) RegisterServer(config ClientConfig) error {
 		return fmt.Errorf("server %s already registered", config.Name)
 	}
 
-	client := NewClient(config)
-	m.clients[config.Name] = client
+	var client ClientIface
+	if config.TransportType == "http" {
+		if config.HTTPBaseURL == "" {
+			return fmt.Errorf("HTTPBaseURL is required for HTTP transport")
+		}
+		client = NewHTTPClient(config, config.OAuthProvider)
+	} else {
+		client = NewClient(config)
+	}
 
+	m.clients[config.Name] = client
 	return nil
 }
 
-// StartServer starts an MCP server
+// StartServer starts an MCP server by name.
 func (m *Manager) StartServer(ctx context.Context, name string) error {
 	m.mu.RLock()
 	client, exists := m.clients[name]
@@ -48,7 +72,7 @@ func (m *Manager) StartServer(ctx context.Context, name string) error {
 	return client.Start(ctx)
 }
 
-// StopServer stops an MCP server
+// StopServer stops an MCP server by name.
 func (m *Manager) StopServer(name string) error {
 	m.mu.RLock()
 	client, exists := m.clients[name]
@@ -61,8 +85,8 @@ func (m *Manager) StopServer(name string) error {
 	return client.Stop()
 }
 
-// GetClient returns an MCP client by name
-func (m *Manager) GetClient(name string) (*Client, error) {
+// GetClient returns an MCP client by name.
+func (m *Manager) GetClient(name string) (ClientIface, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
@@ -74,7 +98,7 @@ func (m *Manager) GetClient(name string) (*Client, error) {
 	return client, nil
 }
 
-// ListServers returns all registered servers
+// ListServers returns the status of all registered servers.
 func (m *Manager) ListServers() []ServerStatus {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -91,20 +115,22 @@ func (m *Manager) ListServers() []ServerStatus {
 			serverInfo = client.GetServerInfo()
 		}
 
+		cfg := client.GetConfig()
 		servers = append(servers, ServerStatus{
-			Name:       name,
-			Command:    client.command,
-			Args:       client.args,
-			Status:     status,
-			ServerInfo: serverInfo,
-			StartedAt:  client.startedAt,
+			Name:          name,
+			TransportType: cfg.TransportType,
+			Command:       cfg.Command,
+			Args:          cfg.Args,
+			HTTPBaseURL:   cfg.HTTPBaseURL,
+			Status:        status,
+			ServerInfo:    serverInfo,
 		})
 	}
 
 	return servers
 }
 
-// StopAll stops all running servers
+// StopAll stops all running servers.
 func (m *Manager) StopAll() error {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -121,12 +147,14 @@ func (m *Manager) StopAll() error {
 	return lastErr
 }
 
-// ServerStatus represents the status of an MCP server
+// ServerStatus represents the status of a registered MCP server.
 type ServerStatus struct {
-	Name       string
-	Command    string
-	Args       []string
-	Status     string
-	ServerInfo *ServerInfo
-	StartedAt  time.Time
+	Name          string
+	TransportType string
+	Command       string
+	Args          []string
+	HTTPBaseURL   string
+	Status        string
+	ServerInfo    *ServerInfo
+	StartedAt     time.Time
 }

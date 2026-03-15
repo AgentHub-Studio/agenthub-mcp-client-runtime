@@ -142,6 +142,16 @@ type ResourceContent struct {
 	Blob     string `json:"blob,omitempty"` // Base64 encoded
 }
 
+// ========== Protocol Version ==========
+
+// ProtocolVersion is the MCP protocol version implemented by this client.
+const ProtocolVersion = "2025-03-26"
+
+// OAuthTokenProvider abstracts the OAuth token source used by the HTTP transport.
+type OAuthTokenProvider interface {
+	Token() (string, error)
+}
+
 // ========== Error Codes ==========
 
 const (
