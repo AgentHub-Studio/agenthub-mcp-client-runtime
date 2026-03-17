@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"log"
 	"net"
@@ -13,7 +14,9 @@ import (
 	"github.com/agenthub/mcp-client-runtime/internal/backend"
 	"github.com/agenthub/mcp-client-runtime/internal/grpc"
 	"github.com/agenthub/mcp-client-runtime/internal/mcp"
+	"github.com/agenthub/mcp-client-runtime/internal/migrate"
 	"github.com/agenthub/mcp-client-runtime/internal/oauth"
+	_ "github.com/jackc/pgx/v5/stdlib"
 	"google.golang.org/grpc/reflection"
 	grpcserver "google.golang.org/grpc"
 )
@@ -23,6 +26,10 @@ type Config struct {
 	GRPCPort string
 	HTTPPort string
 	LogLevel string
+
+	// Database — required for running migrations on startup.
+	// Format: postgres://user:pass@host:5432/dbname
+	DatabaseURL string // DATABASE_URL
 
 	// Backend integration — used to load MCP server configurations on startup.
 	// The backend determines the tenant from the JWT iss claim (Keycloak realm = tenant UUID).
@@ -46,6 +53,7 @@ func loadConfig() *Config {
 		GRPCPort:        getEnv("GRPC_PORT", "50051"),
 		HTTPPort:        getEnv("HTTP_PORT", "8080"),
 		LogLevel:        getEnv("LOG_LEVEL", "info"),
+		DatabaseURL:     getEnv("DATABASE_URL", ""),
 		BackendURL:      getEnv("AGENTHUB_BACKEND_URL", ""),
 		TenantID:        getEnv("AGENTHUB_TENANT_ID", ""),
 		KeycloakBaseURL: getEnv("AGENTHUB_KEYCLOAK_BASE_URL", ""),
@@ -70,11 +78,20 @@ func main() {
 	log.Printf("Configurações: gRPC=%s, HTTP=%s, LogLevel=%s",
 		config.GRPCPort, config.HTTPPort, config.LogLevel)
 
-	mcpManager := mcp.NewManager()
-	log.Println("MCP Manager criado")
-
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// Run database migrations before starting servers.
+	if config.DatabaseURL != "" && config.TenantID != "" {
+		if err := runMigrations(ctx, config); err != nil {
+			log.Fatalf("Falha ao executar migrations: %v", err)
+		}
+	} else {
+		log.Println("DATABASE_URL ou AGENTHUB_TENANT_ID não configurados — migrations ignoradas")
+	}
+
+	mcpManager := mcp.NewManager()
+	log.Println("MCP Manager criado")
 
 	if config.BackendURL != "" {
 		bootstrapConfigs(ctx, config, mcpManager)
@@ -108,6 +125,30 @@ func main() {
 	mcpManager.StopAll()
 
 	log.Println("MCP Client Runtime desligado com sucesso")
+}
+
+// runMigrations opens a database connection, applies all pending migrations, then closes it.
+// The connection is intentionally short-lived — only used during startup for schema management.
+func runMigrations(ctx context.Context, config *Config) error {
+	log.Printf("migrate: connecting to database for migrations (tenant=%s)", config.TenantID)
+
+	db, err := sql.Open("pgx", config.DatabaseURL)
+	if err != nil {
+		return fmt.Errorf("open db: %w", err)
+	}
+	defer db.Close()
+
+	if err := db.PingContext(ctx); err != nil {
+		return fmt.Errorf("ping db: %w", err)
+	}
+
+	m := migrate.New(db, config.TenantID)
+	if err := m.Run(ctx); err != nil {
+		return fmt.Errorf("run migrations: %w", err)
+	}
+
+	log.Println("migrate: all migrations applied successfully")
+	return nil
 }
 
 // buildBackendTokenProvider selects the appropriate token provider for the backend API.

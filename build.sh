@@ -1,5 +1,5 @@
 #!/bin/bash
-GO_IMAGE="golang:1.21"
+GO_IMAGE="golang:1.24"
 
 docker run --rm \
   -v "$(pwd)":/app \
