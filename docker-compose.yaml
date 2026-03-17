@@ -1,0 +1,23 @@
+services:
+  agenthub-mcp-client-runtime:
+    build: .
+    container_name: agenthub-mcp-client-runtime
+    restart: unless-stopped
+    ports:
+      - "8085:8080"
+      - "50051:50051"
+    environment:
+      GRPC_PORT: 50051
+      HTTP_PORT: 8080
+      LOG_LEVEL: info
+      AGENTHUB_BACKEND_URL: http://agenthub.backend.internal:8090
+      AGENTHUB_KEYCLOAK_BASE_URL: http://keycloak.internal:8080
+    networks:
+      agenthub-shared-net:
+        aliases:
+          - agenthub.mcp-client.internal
+
+networks:
+  agenthub-shared-net:
+    external: true
+    name: agenthub-shared-net
