@@ -72,6 +72,7 @@ func getEnv(key, defaultValue string) string {
 }
 
 func main() {
+	printBanner()
 	log.Println("Iniciando MCP Client Runtime...")
 
 	config := loadConfig()
