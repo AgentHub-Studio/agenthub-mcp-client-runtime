@@ -4,7 +4,10 @@ package oauth
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"net/http"
+	"strings"
 	"time"
 
 	"golang.org/x/oauth2"
@@ -68,4 +71,58 @@ func (c *TokenClient) Token() (string, error) {
 		return "", fmt.Errorf("erro ao obter token OAuth: %w", err)
 	}
 	return t.AccessToken, nil
+}
+
+// DynamicClientRegistrationRequest represents the client metadata for DCR.
+type DynamicClientRegistrationRequest struct {
+	ClientName    string   `json:"client_name,omitempty"`
+	RedirectURIs  []string `json:"redirect_uris"`
+	ResponseTypes []string `json:"response_types,omitempty"`
+	GrantTypes    []string `json:"grant_types,omitempty"`
+	Scope         string   `json:"scope,omitempty"`
+}
+
+// DynamicClientRegistrationResponse represents the response from the registration endpoint.
+type DynamicClientRegistrationResponse struct {
+	ClientID                string `json:"client_id"`
+	ClientSecret            string `json:"client_secret,omitempty"`
+	ClientIDIssuedAt        int64  `json:"client_id_issued_at,omitempty"`
+	ClientSecretExpiresAt   int64  `json:"client_secret_expires_at,omitempty"`
+	RegistrationAccessToken string `json:"registration_access_token,omitempty"`
+	RegistrationClientURI   string `json:"registration_client_uri,omitempty"`
+}
+
+// RegisterDynamicClient performs RFC 7591 Dynamic Client Registration.
+func RegisterDynamicClient(ctx context.Context, registrationURL string, req DynamicClientRegistrationRequest) (*DynamicClientRegistrationResponse, error) {
+	if registrationURL == "" {
+		return nil, fmt.Errorf("registrationURL é obrigatório")
+	}
+
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("erro ao codificar requisição DCR: %w", err)
+	}
+
+	hReq, err := http.NewRequestWithContext(ctx, "POST", registrationURL, strings.NewReader(string(body)))
+	if err != nil {
+		return nil, fmt.Errorf("erro ao criar requisição DCR: %w", err)
+	}
+	hReq.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(hReq)
+	if err != nil {
+		return nil, fmt.Errorf("erro ao executar requisição DCR: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("servidor retornou status %d no registro dinâmico", resp.StatusCode)
+	}
+
+	var dcrResp DynamicClientRegistrationResponse
+	if err := json.NewDecoder(resp.Body).Decode(&dcrResp); err != nil {
+		return nil, fmt.Errorf("erro ao decodificar resposta DCR: %w", err)
+	}
+
+	return &dcrResp, nil
 }

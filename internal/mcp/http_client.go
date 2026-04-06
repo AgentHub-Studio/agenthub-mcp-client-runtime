@@ -27,6 +27,7 @@ type HTTPClient struct {
 	isRunning  bool
 	startedAt  time.Time
 	authMetadata AuthMetadata
+	oauthProvider OAuthTokenProvider
 
 	nextID atomic.Int64
 }

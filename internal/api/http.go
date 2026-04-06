@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/agenthub/mcp-client-runtime/internal/mcp"
 	"github.com/agenthub/mcp-client-runtime/internal/oauth"
@@ -49,8 +50,8 @@ func (s *HTTPServer) setupRoutes() {
 	s.router.GET("/servers/:name/prompts", s.handleListPrompts)
 	s.router.GET("/servers/:name/resources", s.handleListResources)
 
-	// Execution (for testing/debugging)
-	s.router.POST("/servers/:name/tools/:tool", s.handleExecuteTool)
+	// Registration (DCR)
+	s.router.POST("/servers/:name/register-client", s.handleRegisterDynamicClient)
 }
 
 // Start starts the HTTP server
@@ -154,8 +155,18 @@ func (s *HTTPServer) handleRegisterServer(c *gin.Context) {
 		return
 	}
 
-	// Auto-start if requested
-	if req.AutoStart {
+	// For HTTP transport, we should trigger a discovery check immediately if it's auto-started
+	// or even if it's not, to have metadata ready for the "Connect" button in the UI.
+	if req.TransportType == "http" {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			// Starting the server in HTTP transport just initializes the client and potentially 
+			// triggers the 401 discovery if we do a trial request.
+			_ = s.mcpManager.StartServer(ctx, req.Name)
+		}()
+	} else if req.AutoStart {
+		// Auto-start for stdio
 		if err := s.mcpManager.StartServer(context.Background(), req.Name); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{
 				"error":   fmt.Sprintf("registered but failed to start: %v", err),
@@ -291,4 +302,41 @@ func (s *HTTPServer) handleExecuteTool(c *gin.Context) {
 		"result":  result.Content,
 		"isError": result.IsError,
 	})
+}
+
+func (s *HTTPServer) handleRegisterDynamicClient(c *gin.Context) {
+	name := c.Param("name")
+
+	var req oauth.DynamicClientRegistrationRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	servers := s.mcpManager.ListServers()
+	var serverStatus *mcp.ServerStatus
+	for _, srv := range servers {
+		if srv.Name == name {
+			serverStatus = &srv
+			break
+		}
+	}
+
+	if serverStatus == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "server not found"})
+		return
+	}
+
+	if serverStatus.AuthMetadata == nil || serverStatus.AuthMetadata.RegistrationURL == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "server does not support dynamic registration (no registration_url found)"})
+		return
+	}
+
+	resp, err := oauth.RegisterDynamicClient(c.Request.Context(), serverStatus.AuthMetadata.RegistrationURL, req)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, resp)
 }
