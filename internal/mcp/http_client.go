@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -48,19 +49,24 @@ func NewHTTPClient(config ClientConfig, oauth OAuthTokenProvider) *HTTPClient {
 
 // Start performs the MCP initialize handshake and marks the client as running.
 func (c *HTTPClient) Start(ctx context.Context) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.mu.RLock()
+	running := c.isRunning
+	c.mu.RUnlock()
 
-	if c.isRunning {
+	if running {
 		return fmt.Errorf("client already running")
 	}
 
+	// NOTE: initialize calls sendRequest which may need to acquire c.mu
+	// on 401 responses to store auth metadata. We must NOT hold the lock here.
 	if err := c.initialize(ctx); err != nil {
 		return fmt.Errorf("failed to initialize MCP HTTP connection: %w", err)
 	}
 
+	c.mu.Lock()
 	c.isRunning = true
 	c.startedAt = time.Now()
+	c.mu.Unlock()
 	return nil
 }
 
@@ -143,7 +149,7 @@ func (c *HTTPClient) sendRequest(ctx context.Context, method string, params inte
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/mcp", bytes.NewReader(body))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL, bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create HTTP request: %w", err)
 	}
@@ -174,7 +180,9 @@ func (c *HTTPClient) sendRequest(ctx context.Context, method string, params inte
 
  	// Fallback: Check well-known URL if not in header.
  	if metadata.ResourceMetadataURL == "" {
- 		metadata.ResourceMetadataURL = c.baseURL + "/.well-known/oauth-protected-resource"
+ 		if parsed, err := url.Parse(c.baseURL); err == nil {
+ 			metadata.ResourceMetadataURL = parsed.Scheme + "://" + parsed.Host + "/.well-known/oauth-protected-resource"
+ 		}
  	}
 
  	// Active Discovery: If we have a metadata URL, fetch it.
@@ -182,10 +190,12 @@ func (c *HTTPClient) sendRequest(ctx context.Context, method string, params inte
  		_ = c.fetchResourceMetadata(ctx, &metadata)
  	}
 
- 	if c.config.OnAuthRequired != nil {
-			c.mu.Lock()
-			c.authMetadata = metadata
-			c.mu.Unlock()
+ 	// Always persist discovered metadata so GetAuthMetadata() can return it
+		c.mu.Lock()
+		c.authMetadata = metadata
+		c.mu.Unlock()
+
+		if c.config.OnAuthRequired != nil {
 			go c.config.OnAuthRequired(metadata)
 		}
 
@@ -245,7 +255,7 @@ func (c *HTTPClient) sendNotification(ctx context.Context, method string, params
 		return err
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/mcp", bytes.NewReader(body))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
