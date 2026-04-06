@@ -313,30 +313,31 @@ func (s *HTTPServer) handleRegisterDynamicClient(c *gin.Context) {
 		return
 	}
 
-	servers := s.mcpManager.ListServers()
-	var serverStatus *mcp.ServerStatus
-	for _, srv := range servers {
-		if srv.Name == name {
-			serverStatus = &srv
-			break
-		}
-	}
-
-	if serverStatus == nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "server not found"})
+	client, err := s.mcpManager.GetClient(name)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 		return
 	}
 
-	if serverStatus.AuthMetadata == nil || serverStatus.AuthMetadata.RegistrationURL == "" {
+	httpClient, ok := client.(*mcp.HTTPClient)
+	if !ok {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "not an HTTP client"})
+		return
+	}
+
+	metadata := httpClient.GetAuthMetadata()
+	if metadata == nil || metadata.RegistrationURL == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "server does not support dynamic registration (no registration_url found)"})
 		return
 	}
 
-	resp, err := oauth.RegisterDynamicClient(c.Request.Context(), serverStatus.AuthMetadata.RegistrationURL, req)
+	resp, err := oauth.RegisterDynamicClient(c.Request.Context(), metadata.RegistrationURL, req)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+
+	httpClient.SetDynamicClientID(resp.ClientID)
 
 	c.JSON(http.StatusOK, resp)
 }

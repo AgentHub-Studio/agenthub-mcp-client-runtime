@@ -64,6 +64,13 @@ func (c *HTTPClient) Start(ctx context.Context) error {
 	return nil
 }
 
+// SetDynamicClientID sets the client ID obtained from DCR.
+func (c *HTTPClient) SetDynamicClientID(clientID string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.dynamicClientID = clientID
+}
+
 // Stop marks the client as stopped. No network call is required for HTTP transport.
 func (c *HTTPClient) Stop() error {
 	c.mu.Lock()
