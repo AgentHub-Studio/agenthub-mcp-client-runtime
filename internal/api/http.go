@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/agenthub/mcp-client-runtime/internal/mcp"
@@ -221,12 +222,19 @@ func (s *HTTPServer) handleListTools(c *gin.Context) {
 		return
 	}
 
-	// Try to start if not running (handshake)
+ // Try to start if not running (handshake)
 	if !client.IsRunning() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		err := client.Start(ctx)
 		cancel()
 		if err != nil {
+			if isAuthError(err) {
+				c.JSON(http.StatusUnauthorized, gin.H{
+					"error":         fmt.Sprintf("failed to start client: %v", err),
+					"auth_required": true,
+				})
+				return
+			}
 			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to start client: %v", err)})
 			return
 		}
@@ -252,12 +260,19 @@ func (s *HTTPServer) handleListPrompts(c *gin.Context) {
 		return
 	}
 
-	// Try to start if not running (handshake)
+ // Try to start if not running (handshake)
 	if !client.IsRunning() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		err := client.Start(ctx)
 		cancel()
 		if err != nil {
+			if isAuthError(err) {
+				c.JSON(http.StatusUnauthorized, gin.H{
+					"error":         fmt.Sprintf("failed to start client: %v", err),
+					"auth_required": true,
+				})
+				return
+			}
 			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to start client: %v", err)})
 			return
 		}
@@ -283,12 +298,19 @@ func (s *HTTPServer) handleListResources(c *gin.Context) {
 		return
 	}
 
-	// Try to start if not running (handshake)
+ // Try to start if not running (handshake)
 	if !client.IsRunning() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		err := client.Start(ctx)
 		cancel()
 		if err != nil {
+			if isAuthError(err) {
+				c.JSON(http.StatusUnauthorized, gin.H{
+					"error":         fmt.Sprintf("failed to start client: %v", err),
+					"auth_required": true,
+				})
+				return
+			}
 			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to start client: %v", err)})
 			return
 		}
@@ -303,6 +325,16 @@ func (s *HTTPServer) handleListResources(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"resources": result.Resources,
 	})
+}
+
+// isAuthError returns true if the error is an OAuth authentication failure (401).
+func isAuthError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "authentication failed (401)") ||
+		strings.Contains(msg, "OAuth access token invalid or expired")
 }
 
 type ExecuteToolRequest struct {
