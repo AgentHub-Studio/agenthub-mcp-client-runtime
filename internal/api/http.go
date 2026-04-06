@@ -39,6 +39,7 @@ func (s *HTTPServer) setupRoutes() {
 
 	// Server management
 	s.router.GET("/servers", s.handleListServers)
+	s.router.GET("/servers/:name/status", s.handleGetServerStatus)
 	s.router.POST("/servers", s.handleRegisterServer)
 	s.router.POST("/servers/:name/start", s.handleStartServer)
 	s.router.POST("/servers/:name/stop", s.handleStopServer)
@@ -74,6 +75,18 @@ func (s *HTTPServer) handleListServers(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"servers": servers,
 	})
+}
+
+func (s *HTTPServer) handleGetServerStatus(c *gin.Context) {
+	name := c.Param("name")
+	servers := s.mcpManager.ListServers()
+	for _, srv := range servers {
+		if srv.Name == name {
+			c.JSON(http.StatusOK, srv)
+			return
+		}
+	}
+	c.JSON(http.StatusNotFound, gin.H{"error": "server not found"})
 }
 
 // RegisterServerRequest holds the payload for registering an MCP server.
