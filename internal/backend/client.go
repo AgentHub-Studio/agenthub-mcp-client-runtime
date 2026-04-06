@@ -40,6 +40,8 @@ type ServerConfig struct {
 	OAuthClientID     string            `json:"oauthClientId"`
 	OAuthClientSecret string            `json:"oauthClientSecret"`
 	OAuthScopes       []string          `json:"oauthScopes"`
+	OAuthBearerToken  string            `json:"oauthBearerToken"`
+	OAuthRefreshToken string            `json:"oauthRefreshToken"`
 	AutoStart         bool              `json:"autoStart"`
 	Enabled           bool              `json:"enabled"`
 }

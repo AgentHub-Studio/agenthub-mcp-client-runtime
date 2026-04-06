@@ -82,6 +82,24 @@ func (m *Manager) StartServer(ctx context.Context, name string) error {
 	return client.Start(ctx)
 }
 
+// UnregisterServer stops and removes a server from the manager.
+func (m *Manager) UnregisterServer(name string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	client, exists := m.clients[name]
+	if !exists {
+		return fmt.Errorf("server %s not found", name)
+	}
+
+	if client.IsRunning() {
+		_ = client.Stop()
+	}
+
+	delete(m.clients, name)
+	return nil
+}
+
 // StopServer stops an MCP server by name.
 func (m *Manager) StopServer(name string) error {
 	m.mu.RLock()

@@ -41,8 +41,8 @@ func (s *HTTPServer) setupRoutes() {
 
 	// Server management
 	s.router.GET("/servers", s.handleListServers)
-	s.router.GET("/servers/:name/status", s.handleGetServerStatus)
 	s.router.POST("/servers", s.handleRegisterServer)
+	s.router.DELETE("/servers/:name", s.handleUnregisterServer)
 	s.router.POST("/servers/:name/start", s.handleStartServer)
 	s.router.POST("/servers/:name/stop", s.handleStopServer)
 
@@ -106,11 +106,13 @@ type RegisterServerRequest struct {
 	TransportType string `json:"transportType"` // "stdio" or "http"
 	HTTPBaseURL   string `json:"httpBaseUrl"`
 
-	// OAuth 2.1 Client Credentials (optional, for protected HTTP servers)
+	// OAuth 2.1 (for protected HTTP servers)
 	OAuthTokenURL     string   `json:"oauthTokenUrl"`
 	OAuthClientID     string   `json:"oauthClientId"`
 	OAuthClientSecret string   `json:"oauthClientSecret"`
 	OAuthScopes       []string `json:"oauthScopes"`
+	OAuthBearerToken  string   `json:"oauthBearerToken"`
+	OAuthRefreshToken string   `json:"oauthRefreshToken"`
 }
 
 func (s *HTTPServer) handleRegisterServer(c *gin.Context) {
@@ -137,13 +139,27 @@ func (s *HTTPServer) handleRegisterServer(c *gin.Context) {
 
 	// Build OAuth provider when credentials are supplied for HTTP transport
 	if req.TransportType == "http" && req.OAuthTokenURL != "" {
-		tokenClient, err := oauth.NewTokenClient(
-			context.Background(),
-			req.OAuthTokenURL,
-			req.OAuthClientID,
-			req.OAuthClientSecret,
-			req.OAuthScopes,
-		)
+		var tokenClient *oauth.TokenClient
+		var err error
+		if req.OAuthBearerToken != "" {
+			tokenClient = oauth.NewAuthCodeTokenClient(
+				context.Background(),
+				req.OAuthTokenURL,
+				req.OAuthClientID,
+				req.OAuthClientSecret,
+				req.OAuthBearerToken,
+				req.OAuthRefreshToken,
+			)
+		} else {
+			tokenClient, err = oauth.NewTokenClient(
+				context.Background(),
+				req.OAuthTokenURL,
+				req.OAuthClientID,
+				req.OAuthClientSecret,
+				req.OAuthScopes,
+			)
+		}
+		
 		if err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("erro ao configurar OAuth: %v", err)})
 			return
@@ -216,6 +232,18 @@ func (s *HTTPServer) handleStopServer(c *gin.Context) {
 
 	c.JSON(http.StatusOK, gin.H{
 		"message": "server stopped successfully",
+		"name":    name,
+	})
+}
+
+func (s *HTTPServer) handleUnregisterServer(c *gin.Context) {
+	name := c.Param("name")
+	if err := s.mcpManager.UnregisterServer(name); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"message": "server unregistered successfully",
 		"name":    name,
 	})
 }
