@@ -5,6 +5,7 @@ package oauth
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/clientcredentials"
@@ -37,6 +38,27 @@ func NewTokenClient(ctx context.Context, tokenURL, clientID, clientSecret string
 	source := oauth2.ReuseTokenSource(nil, cfg.TokenSource(ctx))
 
 	return &TokenClient{source: source}, nil
+}
+
+// NewAuthCodeTokenClient creates a token client for the Authorization Code flow.
+// This assumes the initial token/refresh token are already obtained.
+func NewAuthCodeTokenClient(ctx context.Context, tokenURL, clientID, clientSecret, accessToken, refreshToken string) *TokenClient {
+	cfg := &oauth2.Config{
+		ClientID:     clientID,
+		ClientSecret: clientSecret,
+		Endpoint: oauth2.Endpoint{
+			TokenURL: tokenURL,
+		},
+	}
+
+	initialToken := &oauth2.Token{
+		AccessToken:  accessToken,
+		RefreshToken: refreshToken,
+		Expiry:       time.Now().Add(1 * time.Hour), // Assume 1h if unknown, source will refresh if expired
+	}
+
+	source := cfg.TokenSource(ctx, initialToken)
+	return &TokenClient{source: source}
 }
 
 // Token returns a valid access token, fetching or renewing it as needed.
