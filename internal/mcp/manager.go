@@ -56,6 +56,16 @@ func (m *Manager) RegisterServer(config ClientConfig) error {
 	}
 
 	m.clients[config.Name] = client
+
+	// Probe for metadata if HTTP transport
+	if config.TransportType == "http" {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			_ = client.Start(ctx)
+		}()
+	}
+
 	return nil
 }
 

@@ -11,6 +11,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/agenthub/mcp-client-runtime/internal/oauth"
 )
 
 // HTTPClient implements the MCP client over Streamable HTTP transport (spec 2025-03-26).
@@ -28,6 +30,7 @@ type HTTPClient struct {
 	startedAt  time.Time
 	authMetadata AuthMetadata
 	oauthProvider OAuthTokenProvider
+	dynamicClientID string
 
 	nextID atomic.Int64
 }
@@ -162,14 +165,17 @@ func (c *HTTPClient) sendRequest(ctx context.Context, method string, params inte
 			}
 		}
 
-		// Fallback: Check well-known URL if not in header.
-		if metadata.ResourceMetadataURL == "" {
-			// In a real implementation, we might want to try to fetch /.well-known/oauth-protected-resource here
-			// or at least signal that we should try it.
-			metadata.ResourceMetadataURL = c.baseURL + "/.well-known/oauth-protected-resource"
-		}
+ 	// Fallback: Check well-known URL if not in header.
+ 	if metadata.ResourceMetadataURL == "" {
+ 		metadata.ResourceMetadataURL = c.baseURL + "/.well-known/oauth-protected-resource"
+ 	}
 
-		if c.config.OnAuthRequired != nil {
+ 	// Active Discovery: If we have a metadata URL, fetch it.
+ 	if metadata.ResourceMetadataURL != "" {
+ 		_ = c.fetchResourceMetadata(ctx, &metadata)
+ 	}
+
+ 	if c.config.OnAuthRequired != nil {
 			c.mu.Lock()
 			c.authMetadata = metadata
 			c.mu.Unlock()
@@ -255,7 +261,105 @@ func (c *HTTPClient) GetAuthMetadata() *AuthMetadata {
 		return nil
 	}
 	copy := c.authMetadata
+	if c.dynamicClientID != "" {
+		copy.ClientID = c.dynamicClientID
+	}
 	return &copy
+}
+
+// fetchResourceMetadata fetches and parses the OAuth Protected Resource metadata.
+func (c *HTTPClient) fetchResourceMetadata(ctx context.Context, metadata *AuthMetadata) error {
+	req, err := http.NewRequestWithContext(ctx, "GET", metadata.ResourceMetadataURL, nil)
+	if err != nil {
+		return err
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("resource metadata endpoint returned %d", resp.StatusCode)
+	}
+
+	var data struct {
+		AuthorizationServers []string `json:"authorization_servers"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		return err
+	}
+
+	if len(data.AuthorizationServers) > 0 {
+		metadata.Issuer = data.AuthorizationServers[0]
+		// Discover authorization server metadata (RFC 8414)
+		_ = c.fetchAuthServerMetadata(ctx, metadata)
+	}
+
+	return nil
+}
+
+// fetchAuthServerMetadata discovers authorization server endpoints using RFC 8414.
+func (c *HTTPClient) fetchAuthServerMetadata(ctx context.Context, metadata *AuthMetadata) error {
+	discoveryURL := strings.TrimSuffix(metadata.Issuer, "/") + "/.well-known/oauth-authorization-server"
+	// Also try OpenID Connect discovery fallback
+	if strings.Contains(metadata.Issuer, "auth.atlassian.com") {
+		discoveryURL = metadata.Issuer + "/.well-known/openid-configuration"
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "GET", discoveryURL, nil)
+	if err != nil {
+		return err
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("auth server metadata endpoint returned %d", resp.StatusCode)
+	}
+
+	var data struct {
+		AuthorizationEndpoint string   `json:"authorization_endpoint"`
+		TokenEndpoint         string   `json:"token_endpoint"`
+		RegistrationEndpoint  string   `json:"registration_endpoint"`
+		ScopesSupported       []string `json:"scopes_supported"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		return err
+	}
+
+	metadata.AuthorizationURL = data.AuthorizationEndpoint
+	metadata.TokenURL = data.TokenEndpoint
+	metadata.RegistrationURL = data.RegistrationEndpoint
+	metadata.ScopesSupported = data.ScopesSupported
+
+	// If we have a registration endpoint and no client ID, try DCR!
+	if metadata.RegistrationURL != "" && c.dynamicClientID == "" {
+		c.tryDynamicRegistration(ctx, metadata)
+	}
+
+	return nil
+}
+
+func (c *HTTPClient) tryDynamicRegistration(ctx context.Context, metadata *AuthMetadata) {
+	req := oauth.DynamicClientRegistrationRequest{
+		ClientName:   "AgentHub MCP Client",
+		RedirectURIs: []string{"https://api.cezar.dev/api/mcp/callback"}, // TODO: Make configurable
+		GrantTypes:   []string{"authorization_code", "refresh_token"},
+		ResponseTypes: []string{"code"},
+	}
+
+	resp, err := oauth.RegisterDynamicClient(ctx, metadata.RegistrationURL, req)
+	if err == nil && resp.ClientID != "" {
+		c.mu.Lock()
+		c.dynamicClientID = resp.ClientID
+		c.mu.Unlock()
+	}
 }
 
 // setAuthHeader adds the Bearer token to the request when an OAuth provider is configured.
