@@ -147,7 +147,11 @@ func (c *HTTPClient) sendRequest(ctx context.Context, method string, params inte
 
 	switch httpResp.StatusCode {
 	case http.StatusUnauthorized:
-		return nil, fmt.Errorf("authentication failed (401) — verifique as credenciais OAuth")
+		// Se o servidor retornar 401, notificamos que a autenticação falhou.
+		// No futuro, isso pode disparar um evento para o backend marcar o MCP como 'unauthorized'.
+		return nil, fmt.Errorf("authentication failed (401) — OAuth access token invalid or expired")
+	case http.StatusForbidden:
+		return nil, fmt.Errorf("access forbidden (403) — insufficient scopes or permissions")
 	case http.StatusNoContent:
 		return nil, fmt.Errorf("server returned 204 for a request expecting a response")
 	}
