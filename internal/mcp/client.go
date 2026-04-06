@@ -40,6 +40,20 @@ type ClientConfig struct {
 
 	// Optional OAuth provider for the HTTP transport
 	OAuthProvider OAuthTokenProvider
+
+	// OnAuthRequired is called when the server requires authentication.
+	// It provides the discovered metadata (e.g. authURL, tokenURL).
+	OnAuthRequired func(metadata AuthMetadata)
+}
+
+// AuthMetadata contains discovered OAuth2 metadata from the MCP server.
+type AuthMetadata struct {
+	ResourceMetadataURL string `json:"resource_metadata_url,omitempty"`
+	AuthorizationURL    string `json:"authorization_url,omitempty"`
+	TokenURL            string `json:"token_url,omitempty"`
+	RegistrationURL     string `json:"registration_url,omitempty"`
+	Issuer              string `json:"issuer,omitempty"`
+	ScopesSupported     []string `json:"scopes_supported,omitempty"`
 }
 
 // NewClient creates a new MCP client

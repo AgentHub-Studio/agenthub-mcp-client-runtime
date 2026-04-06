@@ -221,6 +221,10 @@ func bootstrapConfigs(ctx context.Context, config *Config, manager *mcp.Manager)
 			Command:       cfg.Command,
 			Args:          cfg.Args,
 			Env:           buildEnvSlice(cfg.Env),
+			OnAuthRequired: func(metadata mcp.AuthMetadata) {
+				log.Printf("Auth required for %s: %+v", cfg.Name, metadata)
+				// In a real implementation, this could send a notification back to the backend.
+			},
 		}
 
 		if cfg.TransportType == "http" && cfg.OAuthTokenURL != "" {

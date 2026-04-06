@@ -26,6 +26,7 @@ type HTTPClient struct {
 	serverInfo *ServerInfo
 	isRunning  bool
 	startedAt  time.Time
+	authMetadata AuthMetadata
 
 	nextID atomic.Int64
 }
@@ -147,9 +148,34 @@ func (c *HTTPClient) sendRequest(ctx context.Context, method string, params inte
 
 	switch httpResp.StatusCode {
 	case http.StatusUnauthorized:
-		// Se o servidor retornar 401, notificamos que a autenticação falhou.
-		// No futuro, isso pode disparar um evento para o backend marcar o MCP como 'unauthorized'.
-		return nil, fmt.Errorf("authentication failed (401) — OAuth access token invalid or expired")
+		// MCP Security Spec: Discover OAuth metadata from WWW-Authenticate header.
+		// Example: WWW-Authenticate: Bearer resource_metadata="https://example.com/.well-known/oauth-protected-resource"
+		authHeader := httpResp.Header.Get("WWW-Authenticate")
+		metadata := AuthMetadata{}
+		if strings.Contains(authHeader, "resource_metadata=") {
+			// Basic parsing of resource_metadata="URL"
+			parts := strings.Split(authHeader, "resource_metadata=\"")
+			if len(parts) > 1 {
+				urlParts := strings.Split(parts[1], "\"")
+				metadata.ResourceMetadataURL = urlParts[0]
+			}
+		}
+
+		// Fallback: Check well-known URL if not in header.
+		if metadata.ResourceMetadataURL == "" {
+			// In a real implementation, we might want to try to fetch /.well-known/oauth-protected-resource here
+			// or at least signal that we should try it.
+			metadata.ResourceMetadataURL = c.baseURL + "/.well-known/oauth-protected-resource"
+		}
+
+		if c.config.OnAuthRequired != nil {
+			c.mu.Lock()
+			c.authMetadata = metadata
+			c.mu.Unlock()
+			go c.config.OnAuthRequired(metadata)
+		}
+
+		return nil, fmt.Errorf("authentication failed (401) — OAuth access token invalid or expired. Metadata: %+v", metadata)
 	case http.StatusForbidden:
 		return nil, fmt.Errorf("access forbidden (403) — insufficient scopes or permissions")
 	case http.StatusNoContent:
@@ -218,6 +244,17 @@ func (c *HTTPClient) sendNotification(ctx context.Context, method string, params
 	}
 	defer httpResp.Body.Close()
 	return nil
+}
+
+// GetAuthMetadata returns the discovered OAuth metadata.
+func (c *HTTPClient) GetAuthMetadata() *AuthMetadata {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.authMetadata.ResourceMetadataURL == "" && c.authMetadata.AuthorizationURL == "" {
+		return nil
+	}
+	copy := c.authMetadata
+	return &copy
 }
 
 // setAuthHeader adds the Bearer token to the request when an OAuth provider is configured.

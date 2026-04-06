@@ -115,8 +115,8 @@ func (m *Manager) ListServers() []ServerStatus {
 			serverInfo = client.GetServerInfo()
 		}
 
-		cfg := client.GetConfig()
-		servers = append(servers, ServerStatus{
+ 	cfg := client.GetConfig()
+		statusObj := ServerStatus{
 			Name:          name,
 			TransportType: cfg.TransportType,
 			Command:       cfg.Command,
@@ -124,7 +124,14 @@ func (m *Manager) ListServers() []ServerStatus {
 			HTTPBaseURL:   cfg.HTTPBaseURL,
 			Status:        status,
 			ServerInfo:    serverInfo,
-		})
+		}
+
+		// Try to get auth metadata if HTTP client
+		if httpClient, ok := client.(*HTTPClient); ok {
+			statusObj.AuthMetadata = httpClient.GetAuthMetadata()
+		}
+
+		servers = append(servers, statusObj)
 	}
 
 	return servers
@@ -157,4 +164,5 @@ type ServerStatus struct {
 	Status        string
 	ServerInfo    *ServerInfo
 	StartedAt     time.Time
+	AuthMetadata  *AuthMetadata
 }
