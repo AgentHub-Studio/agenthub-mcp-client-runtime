@@ -221,6 +221,13 @@ func (s *HTTPServer) handleListTools(c *gin.Context) {
 		return
 	}
 
+	// Try to start if not running (handshake)
+	if !client.IsRunning() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = client.Start(ctx)
+		cancel()
+	}
+
 	result, err := client.ListTools(context.Background())
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -241,6 +248,13 @@ func (s *HTTPServer) handleListPrompts(c *gin.Context) {
 		return
 	}
 
+	// Try to start if not running (handshake)
+	if !client.IsRunning() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = client.Start(ctx)
+		cancel()
+	}
+
 	result, err := client.ListPrompts(context.Background())
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -259,6 +273,13 @@ func (s *HTTPServer) handleListResources(c *gin.Context) {
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 		return
+	}
+
+	// Try to start if not running (handshake)
+	if !client.IsRunning() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = client.Start(ctx)
+		cancel()
 	}
 
 	result, err := client.ListResources(context.Background())
