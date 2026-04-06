@@ -166,13 +166,13 @@ func (m *Manager) StopAll() error {
 
 // ServerStatus represents the status of a registered MCP server.
 type ServerStatus struct {
-	Name          string
-	TransportType string
-	Command       string
-	Args          []string
-	HTTPBaseURL   string
-	Status        string
-	ServerInfo    *ServerInfo
-	StartedAt     time.Time
-	AuthMetadata  *AuthMetadata
+	Name          string        `json:"Name"`
+	TransportType string        `json:"TransportType"`
+	Command       string        `json:"Command,omitempty"`
+	Args          []string      `json:"Args,omitempty"`
+	HTTPBaseURL   string        `json:"HTTPBaseURL,omitempty"`
+	Status        string        `json:"Status"`
+	ServerInfo    *ServerInfo   `json:"ServerInfo,omitempty"`
+	StartedAt     time.Time     `json:"StartedAt,omitempty"`
+	AuthMetadata  *AuthMetadata `json:"AuthMetadata,omitempty"`
 }
