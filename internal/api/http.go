@@ -189,6 +189,13 @@ func (s *HTTPServer) handleStartServer(c *gin.Context) {
 	name := c.Param("name")
 
 	if err := s.mcpManager.StartServer(context.Background(), name); err != nil {
+		if strings.Contains(err.Error(), "401") || strings.Contains(err.Error(), "auth") {
+			c.JSON(http.StatusUnauthorized, gin.H{
+				"error":         fmt.Sprintf("failed to start server: %v", err),
+				"auth_required": true,
+			})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
