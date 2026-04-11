@@ -227,18 +227,40 @@ func bootstrapConfigs(ctx context.Context, config *Config, manager *mcp.Manager)
 			},
 		}
 
-		if cfg.TransportType == "http" && cfg.OAuthTokenURL != "" {
-			tokenClient, err := oauth.NewTokenClient(
-				ctx,
-				cfg.OAuthTokenURL,
-				cfg.OAuthClientID,
-				cfg.OAuthClientSecret,
-				cfg.OAuthScopes,
-			)
-			if err != nil {
-				log.Printf("Aviso: falha ao configurar OAuth para %q: %v", cfg.Name, err)
-			} else {
-				clientConfig.OAuthProvider = tokenClient
+		// Configure auth provider for HTTP transport.
+		// Mode 1: Static token (PAT) — bearerToken set, no tokenURL.
+		// Mode 2: Authorization Code flow — bearerToken + tokenURL (refresh via token endpoint).
+		// Mode 3: Client Credentials flow — tokenURL + clientID (machine-to-machine).
+		if cfg.TransportType == "http" {
+			if cfg.OAuthBearerToken != "" && cfg.OAuthTokenURL == "" {
+				log.Printf("Servidor %q: usando token estático (PAT)", cfg.Name)
+				clientConfig.OAuthProvider = oauth.NewStaticTokenProvider(cfg.OAuthBearerToken)
+			} else if cfg.OAuthTokenURL != "" {
+				var tokenClient *oauth.TokenClient
+				var err error
+				if cfg.OAuthBearerToken != "" {
+					tokenClient = oauth.NewAuthCodeTokenClient(
+						ctx,
+						cfg.OAuthTokenURL,
+						cfg.OAuthClientID,
+						cfg.OAuthClientSecret,
+						cfg.OAuthBearerToken,
+						cfg.OAuthRefreshToken,
+					)
+				} else {
+					tokenClient, err = oauth.NewTokenClient(
+						ctx,
+						cfg.OAuthTokenURL,
+						cfg.OAuthClientID,
+						cfg.OAuthClientSecret,
+						cfg.OAuthScopes,
+					)
+				}
+				if err != nil {
+					log.Printf("Aviso: falha ao configurar OAuth para %q: %v", cfg.Name, err)
+				} else {
+					clientConfig.OAuthProvider = tokenClient
+				}
 			}
 		}
 

@@ -41,6 +41,7 @@ func (s *HTTPServer) setupRoutes() {
 
 	// Server management
 	s.router.GET("/servers", s.handleListServers)
+	s.router.GET("/servers/:name/status", s.handleGetServerStatus)
 	s.router.POST("/servers", s.handleRegisterServer)
 	s.router.DELETE("/servers/:name", s.handleUnregisterServer)
 	s.router.POST("/servers/:name/start", s.handleStartServer)
@@ -48,6 +49,7 @@ func (s *HTTPServer) setupRoutes() {
 
 	// Discovery
 	s.router.GET("/servers/:name/tools", s.handleListTools)
+	s.router.POST("/servers/:name/tools/:tool/call", s.handleExecuteTool)
 	s.router.GET("/servers/:name/prompts", s.handleListPrompts)
 	s.router.GET("/servers/:name/resources", s.handleListResources)
 
@@ -94,8 +96,8 @@ func (s *HTTPServer) handleGetServerStatus(c *gin.Context) {
 // RegisterServerRequest holds the payload for registering an MCP server.
 // Supports both stdio transport (Command) and Streamable HTTP transport (TransportType + HTTPBaseURL).
 type RegisterServerRequest struct {
-	Name      string            `json:"name" binding:"required"`
-	AutoStart bool              `json:"autoStart"`
+	Name      string `json:"name" binding:"required"`
+	AutoStart bool   `json:"autoStart"`
 
 	// Stdio transport (default when TransportType is empty or "stdio")
 	Command string            `json:"command"`
@@ -137,34 +139,44 @@ func (s *HTTPServer) handleRegisterServer(c *gin.Context) {
 		HTTPBaseURL:   req.HTTPBaseURL,
 	}
 
-	// Build OAuth provider when credentials are supplied for HTTP transport
-	if req.TransportType == "http" && req.OAuthTokenURL != "" {
-		var tokenClient *oauth.TokenClient
-		var err error
-		if req.OAuthBearerToken != "" {
-			tokenClient = oauth.NewAuthCodeTokenClient(
-				context.Background(),
-				req.OAuthTokenURL,
-				req.OAuthClientID,
-				req.OAuthClientSecret,
-				req.OAuthBearerToken,
-				req.OAuthRefreshToken,
-			)
-		} else {
-			tokenClient, err = oauth.NewTokenClient(
-				context.Background(),
-				req.OAuthTokenURL,
-				req.OAuthClientID,
-				req.OAuthClientSecret,
-				req.OAuthScopes,
-			)
+	// Build auth provider for HTTP transport.
+	// Three modes:
+	//   1. Static bearer token (PAT) — OAuthBearerToken set, no OAuthTokenURL
+	//   2. Authorization Code flow — OAuthBearerToken + OAuthTokenURL (refresh via token endpoint)
+	//   3. Client Credentials flow — OAuthTokenURL + OAuthClientID (machine-to-machine)
+	if req.TransportType == "http" {
+		if req.OAuthBearerToken != "" && req.OAuthTokenURL == "" {
+			// Mode 1: Static token (e.g. GitHub PAT) — never expires, no refresh.
+			config.OAuthProvider = oauth.NewStaticTokenProvider(req.OAuthBearerToken)
+		} else if req.OAuthTokenURL != "" {
+			var tokenClient *oauth.TokenClient
+			var err error
+			if req.OAuthBearerToken != "" {
+				// Mode 2: Authorization Code flow with refresh token.
+				tokenClient = oauth.NewAuthCodeTokenClient(
+					context.Background(),
+					req.OAuthTokenURL,
+					req.OAuthClientID,
+					req.OAuthClientSecret,
+					req.OAuthBearerToken,
+					req.OAuthRefreshToken,
+				)
+			} else {
+				// Mode 3: Client Credentials flow.
+				tokenClient, err = oauth.NewTokenClient(
+					context.Background(),
+					req.OAuthTokenURL,
+					req.OAuthClientID,
+					req.OAuthClientSecret,
+					req.OAuthScopes,
+				)
+			}
+			if err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("erro ao configurar OAuth: %v", err)})
+				return
+			}
+			config.OAuthProvider = tokenClient
 		}
-		
-		if err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("erro ao configurar OAuth: %v", err)})
-			return
-		}
-		config.OAuthProvider = tokenClient
 	}
 
 	if err := s.mcpManager.RegisterServer(config); err != nil {
@@ -178,7 +190,7 @@ func (s *HTTPServer) handleRegisterServer(c *gin.Context) {
 		go func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
-			// Starting the server in HTTP transport just initializes the client and potentially 
+			// Starting the server in HTTP transport just initializes the client and potentially
 			// triggers the 401 discovery if we do a trial request.
 			_ = s.mcpManager.StartServer(ctx, req.Name)
 		}()
@@ -257,7 +269,7 @@ func (s *HTTPServer) handleListTools(c *gin.Context) {
 		return
 	}
 
- // Try to start if not running (handshake)
+	// Try to start if not running (handshake)
 	if !client.IsRunning() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		err := client.Start(ctx)
@@ -277,6 +289,13 @@ func (s *HTTPServer) handleListTools(c *gin.Context) {
 
 	result, err := client.ListTools(context.Background())
 	if err != nil {
+		if isAuthError(err) {
+			c.JSON(http.StatusUnauthorized, gin.H{
+				"error":         err.Error(),
+				"auth_required": true,
+			})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -295,7 +314,7 @@ func (s *HTTPServer) handleListPrompts(c *gin.Context) {
 		return
 	}
 
- // Try to start if not running (handshake)
+	// Try to start if not running (handshake)
 	if !client.IsRunning() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		err := client.Start(ctx)
@@ -315,6 +334,13 @@ func (s *HTTPServer) handleListPrompts(c *gin.Context) {
 
 	result, err := client.ListPrompts(context.Background())
 	if err != nil {
+		if isAuthError(err) {
+			c.JSON(http.StatusUnauthorized, gin.H{
+				"error":         err.Error(),
+				"auth_required": true,
+			})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -333,7 +359,7 @@ func (s *HTTPServer) handleListResources(c *gin.Context) {
 		return
 	}
 
- // Try to start if not running (handshake)
+	// Try to start if not running (handshake)
 	if !client.IsRunning() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		err := client.Start(ctx)
@@ -353,6 +379,13 @@ func (s *HTTPServer) handleListResources(c *gin.Context) {
 
 	result, err := client.ListResources(context.Background())
 	if err != nil {
+		if isAuthError(err) {
+			c.JSON(http.StatusUnauthorized, gin.H{
+				"error":         err.Error(),
+				"auth_required": true,
+			})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -390,6 +423,23 @@ func (s *HTTPServer) handleExecuteTool(c *gin.Context) {
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 		return
+	}
+
+	if !client.IsRunning() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		err := client.Start(ctx)
+		cancel()
+		if err != nil {
+			if isAuthError(err) {
+				c.JSON(http.StatusUnauthorized, gin.H{
+					"error":         fmt.Sprintf("failed to start client: %v", err),
+					"auth_required": true,
+				})
+				return
+			}
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to start client: %v", err)})
+			return
+		}
 	}
 
 	result, err := client.CallTool(context.Background(), toolName, req.Arguments)

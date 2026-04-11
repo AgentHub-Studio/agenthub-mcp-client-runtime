@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -25,13 +26,15 @@ type HTTPClient struct {
 	oauth      OAuthTokenProvider
 	httpClient *http.Client
 
-	mu         sync.RWMutex
-	serverInfo *ServerInfo
-	isRunning  bool
-	startedAt  time.Time
-	authMetadata AuthMetadata
-	oauthProvider OAuthTokenProvider
-	dynamicClientID string
+	mu                        sync.RWMutex
+	serverInfo                *ServerInfo
+	isRunning                 bool
+	startedAt                 time.Time
+	authMetadata              AuthMetadata
+	oauthProvider             OAuthTokenProvider
+	dynamicClientID           string
+	sessionID                 string
+	negotiatedProtocolVersion string
 
 	nextID atomic.Int64
 }
@@ -115,7 +118,7 @@ func (c *HTTPClient) initialize(ctx context.Context) error {
 		},
 	}
 
-	response, err := c.sendRequest(ctx, "initialize", params)
+	response, headers, err := c.sendRequestWithHeaders(ctx, "initialize", params)
 	if err != nil {
 		return fmt.Errorf("initialize request failed: %w", err)
 	}
@@ -127,7 +130,16 @@ func (c *HTTPClient) initialize(ctx context.Context) error {
 	if err := json.Unmarshal(response.Result, &result); err != nil {
 		return fmt.Errorf("failed to parse initialize result: %w", err)
 	}
+
+	c.mu.Lock()
 	c.serverInfo = &result.ServerInfo
+	c.sessionID = headers.Get("Mcp-Session-Id")
+	if result.ProtocolVersion != "" {
+		c.negotiatedProtocolVersion = result.ProtocolVersion
+	} else {
+		c.negotiatedProtocolVersion = ProtocolVersion
+	}
+	c.mu.Unlock()
 
 	// Send initialized notification (fire-and-forget)
 	_ = c.sendNotification(ctx, "notifications/initialized", nil)
@@ -137,31 +149,38 @@ func (c *HTTPClient) initialize(ctx context.Context) error {
 // sendRequest sends a JSON-RPC request via POST /mcp with Accept: text/event-stream
 // and returns the first JSON-RPC response from the SSE stream (or JSON fallback).
 func (c *HTTPClient) sendRequest(ctx context.Context, method string, params interface{}) (*JSONRPCResponse, error) {
+	response, _, err := c.sendRequestWithHeaders(ctx, method, params)
+	return response, err
+}
+
+func (c *HTTPClient) sendRequestWithHeaders(ctx context.Context, method string, params interface{}) (*JSONRPCResponse, http.Header, error) {
 	id := c.nextID.Add(1)
 
 	reqMsg, err := NewJSONRPCRequest(id, method, params)
 	if err != nil {
-		return nil, fmt.Errorf("failed to build JSON-RPC request: %w", err)
+		return nil, nil, fmt.Errorf("failed to build JSON-RPC request: %w", err)
 	}
 
 	body, err := json.Marshal(reqMsg)
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal request: %w", err)
+		return nil, nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL, bytes.NewReader(body))
 	if err != nil {
-		return nil, fmt.Errorf("failed to create HTTP request: %w", err)
+		return nil, nil, fmt.Errorf("failed to create HTTP request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Accept", "text/event-stream")
+	httpReq.Header.Set("Accept", "application/json, text/event-stream")
+	c.setProtocolHeaders(httpReq, method)
 	c.setAuthHeader(httpReq)
 
 	httpResp, err := c.httpClient.Do(httpReq)
 	if err != nil {
-		return nil, fmt.Errorf("HTTP request failed: %w", err)
+		return nil, nil, fmt.Errorf("HTTP request failed: %w", err)
 	}
 	defer httpResp.Body.Close()
+	respHeaders := httpResp.Header.Clone()
 
 	switch httpResp.StatusCode {
 	case http.StatusUnauthorized:
@@ -178,19 +197,19 @@ func (c *HTTPClient) sendRequest(ctx context.Context, method string, params inte
 			}
 		}
 
- 	// Fallback: Check well-known URL if not in header.
- 	if metadata.ResourceMetadataURL == "" {
- 		if parsed, err := url.Parse(c.baseURL); err == nil {
- 			metadata.ResourceMetadataURL = parsed.Scheme + "://" + parsed.Host + "/.well-known/oauth-protected-resource"
- 		}
- 	}
+		// Fallback: Check well-known URL if not in header.
+		if metadata.ResourceMetadataURL == "" {
+			if parsed, err := url.Parse(c.baseURL); err == nil {
+				metadata.ResourceMetadataURL = parsed.Scheme + "://" + parsed.Host + "/.well-known/oauth-protected-resource"
+			}
+		}
 
- 	// Active Discovery: If we have a metadata URL, fetch it.
- 	if metadata.ResourceMetadataURL != "" {
- 		_ = c.fetchResourceMetadata(ctx, &metadata)
- 	}
+		// Active Discovery: If we have a metadata URL, fetch it.
+		if metadata.ResourceMetadataURL != "" {
+			_ = c.fetchResourceMetadata(ctx, &metadata)
+		}
 
- 	// Always persist discovered metadata so GetAuthMetadata() can return it
+		// Always persist discovered metadata so GetAuthMetadata() can return it
 		c.mu.Lock()
 		c.authMetadata = metadata
 		c.mu.Unlock()
@@ -199,32 +218,34 @@ func (c *HTTPClient) sendRequest(ctx context.Context, method string, params inte
 			go c.config.OnAuthRequired(metadata)
 		}
 
-		return nil, fmt.Errorf("authentication failed (401) — OAuth access token invalid or expired. Metadata: %+v", metadata)
+		return nil, respHeaders, fmt.Errorf("authentication failed (401) — OAuth access token invalid or expired. Metadata: %+v", metadata)
 	case http.StatusForbidden:
-		return nil, fmt.Errorf("access forbidden (403) — insufficient scopes or permissions")
+		return nil, respHeaders, fmt.Errorf("access forbidden (403) — insufficient scopes or permissions")
 	case http.StatusNoContent:
-		return nil, fmt.Errorf("server returned 204 for a request expecting a response")
+		return nil, respHeaders, fmt.Errorf("server returned 204 for a request expecting a response")
 	}
 	if httpResp.StatusCode >= 400 {
-		return nil, fmt.Errorf("server returned HTTP %d", httpResp.StatusCode)
+		return nil, respHeaders, fmt.Errorf("server returned HTTP %d%s", httpResp.StatusCode, readErrorSuffix(httpResp.Body))
 	}
 
 	ct := httpResp.Header.Get("Content-Type")
 	if strings.Contains(ct, "text/event-stream") {
-		return parseSSEResponse(httpResp)
+		response, err := parseSSEResponse(httpResp)
+		return response, respHeaders, err
 	}
 
 	// Fallback: plain JSON response
 	var jsonResp JSONRPCResponse
 	if err := json.NewDecoder(httpResp.Body).Decode(&jsonResp); err != nil {
-		return nil, fmt.Errorf("failed to parse JSON response: %w", err)
+		return nil, respHeaders, fmt.Errorf("failed to parse JSON response: %w", err)
 	}
-	return &jsonResp, nil
+	return &jsonResp, respHeaders, nil
 }
 
 // parseSSEResponse reads the SSE stream and returns the first data event as a JSONRPCResponse.
 func parseSSEResponse(resp *http.Response) (*JSONRPCResponse, error) {
 	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 64*1024), 8*1024*1024)
 	for scanner.Scan() {
 		line := scanner.Text()
 		if !strings.HasPrefix(line, "data: ") {
@@ -234,6 +255,12 @@ func parseSSEResponse(resp *http.Response) (*JSONRPCResponse, error) {
 		var jsonResp JSONRPCResponse
 		if err := json.Unmarshal([]byte(data), &jsonResp); err != nil {
 			return nil, fmt.Errorf("failed to parse SSE data as JSON-RPC: %w", err)
+		}
+		// Some MCP servers emit intermediary SSE events that are not the terminal
+		// JSON-RPC response for the request. Ignore payloads that carry neither
+		// result nor error and keep scanning until the actual response arrives.
+		if len(jsonResp.Result) == 0 && jsonResp.Error == nil {
+			continue
 		}
 		return &jsonResp, nil
 	}
@@ -260,6 +287,8 @@ func (c *HTTPClient) sendNotification(ctx context.Context, method string, params
 		return err
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Accept", "application/json, text/event-stream")
+	c.setProtocolHeaders(httpReq, method)
 	c.setAuthHeader(httpReq)
 
 	httpResp, err := c.httpClient.Do(httpReq)
@@ -267,6 +296,12 @@ func (c *HTTPClient) sendNotification(ctx context.Context, method string, params
 		return err
 	}
 	defer httpResp.Body.Close()
+	if httpResp.StatusCode == http.StatusAccepted || httpResp.StatusCode == http.StatusNoContent || httpResp.StatusCode == http.StatusOK {
+		return nil
+	}
+	if httpResp.StatusCode >= 400 {
+		return fmt.Errorf("notification %s failed with HTTP %d%s", method, httpResp.StatusCode, readErrorSuffix(httpResp.Body))
+	}
 	return nil
 }
 
@@ -365,9 +400,9 @@ func (c *HTTPClient) fetchAuthServerMetadata(ctx context.Context, metadata *Auth
 
 func (c *HTTPClient) tryDynamicRegistration(ctx context.Context, metadata *AuthMetadata) {
 	req := oauth.DynamicClientRegistrationRequest{
-		ClientName:   "AgentHub MCP Client",
-		RedirectURIs: []string{"https://api.cezar.dev/api/mcp/callback"}, // TODO: Make configurable
-		GrantTypes:   []string{"authorization_code", "refresh_token"},
+		ClientName:    "AgentHub MCP Client",
+		RedirectURIs:  []string{"https://api.cezar.dev/api/mcp/callback"}, // TODO: Make configurable
+		GrantTypes:    []string{"authorization_code", "refresh_token"},
 		ResponseTypes: []string{"code"},
 	}
 
@@ -388,6 +423,34 @@ func (c *HTTPClient) setAuthHeader(req *http.Request) {
 	if err == nil && token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
+}
+
+func (c *HTTPClient) setProtocolHeaders(req *http.Request, method string) {
+	c.mu.RLock()
+	sessionID := c.sessionID
+	protocolVersion := c.negotiatedProtocolVersion
+	c.mu.RUnlock()
+
+	if protocolVersion == "" {
+		protocolVersion = ProtocolVersion
+	}
+	req.Header.Set("MCP-Protocol-Version", protocolVersion)
+
+	if method != "initialize" && sessionID != "" {
+		req.Header.Set("Mcp-Session-Id", sessionID)
+	}
+}
+
+func readErrorSuffix(body io.Reader) string {
+	data, err := io.ReadAll(io.LimitReader(body, 2048))
+	if err != nil {
+		return ""
+	}
+	msg := strings.TrimSpace(string(data))
+	if msg == "" {
+		return ""
+	}
+	return fmt.Sprintf(": %s", msg)
 }
 
 // ========== MCP methods ==========

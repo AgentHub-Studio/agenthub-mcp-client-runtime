@@ -73,6 +73,23 @@ func (c *TokenClient) Token() (string, error) {
 	return t.AccessToken, nil
 }
 
+// StaticTokenProvider holds a long-lived token (e.g. a GitHub Personal Access Token)
+// that never expires and requires no refresh. This mirrors how Claude Code and
+// similar tools authenticate with GitHub MCP — bind once, never lose the connection.
+type StaticTokenProvider struct {
+	token string
+}
+
+// NewStaticTokenProvider creates a provider that always returns the same token.
+func NewStaticTokenProvider(token string) *StaticTokenProvider {
+	return &StaticTokenProvider{token: token}
+}
+
+// Token returns the static token. It never errors and never expires.
+func (s *StaticTokenProvider) Token() (string, error) {
+	return s.token, nil
+}
+
 // DynamicClientRegistrationRequest represents the client metadata for DCR.
 type DynamicClientRegistrationRequest struct {
 	ClientName    string   `json:"client_name,omitempty"`
