@@ -2,7 +2,9 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -14,9 +16,27 @@ import (
 
 // HTTPServer provides REST API for MCP client
 type HTTPServer struct {
-	router     *gin.Engine
-	mcpManager *mcp.Manager
-	port       int
+	router      *gin.Engine
+	mcpManager  *mcp.Manager
+	port        int
+	// refresher, when set, is called by handleListAllTools to pick up any MCP
+	// server configs that were created after the runtime started.
+	// BUG-MCP-RUNTIME-STALE fix: without this, servers created post-startup are
+	// never registered in the in-memory manager and therefore invisible to agents.
+	refresher ConfigRefresher
+}
+
+// ConfigRefresher is called before aggregating tools to ensure any newly-created
+// MCP server configs are registered in the in-memory manager.
+// Implementations must be idempotent and rate-limit themselves internally.
+type ConfigRefresher interface {
+	Refresh(ctx context.Context)
+}
+
+// WithRefresher sets the config refresher used by handleListAllTools.
+// Must be called before the server starts serving requests.
+func (s *HTTPServer) WithRefresher(r ConfigRefresher) {
+	s.refresher = r
 }
 
 // NewHTTPServer creates a new HTTP server
@@ -47,7 +67,7 @@ func (s *HTTPServer) setupRoutes() {
 	s.router.POST("/servers/:name/start", s.handleStartServer)
 	s.router.POST("/servers/:name/stop", s.handleStopServer)
 
-	// Discovery
+	// Per-server discovery
 	s.router.GET("/servers/:name/tools", s.handleListTools)
 	s.router.POST("/servers/:name/tools/:tool/call", s.handleExecuteTool)
 	s.router.GET("/servers/:name/prompts", s.handleListPrompts)
@@ -55,6 +75,12 @@ func (s *HTTPServer) setupRoutes() {
 
 	// Registration (DCR)
 	s.router.POST("/servers/:name/register-client", s.handleRegisterDynamicClient)
+
+	// Aggregated API — used by agenthub-api MCPToolBridge (P-C253-1).
+	// GET  /api/tools             — list all tools from all running servers
+	// POST /api/tools/call        — invoke a tool on a named server
+	s.router.GET("/api/tools", s.handleListAllTools)
+	s.router.POST("/api/tools/call", s.handleCallAggregatedTool)
 }
 
 // Start starts the HTTP server
@@ -490,4 +516,138 @@ func (s *HTTPServer) handleRegisterDynamicClient(c *gin.Context) {
 	httpClient.SetDynamicClientID(resp.ClientID)
 
 	c.JSON(http.StatusOK, resp)
+}
+
+// ========== Aggregated API (P-C253-1) ==========
+
+// aggregatedTool mirrors MCPToolInfo in agenthub-api — must stay in sync.
+type aggregatedTool struct {
+	ServerName  string      `json:"serverName"`
+	Name        string      `json:"name"`
+	Description string      `json:"description"`
+	InputSchema interface{} `json:"inputSchema"`
+}
+
+// handleListAllTools aggregates tools from every running MCP server so that
+// agenthub-api can call GET /api/tools?tenantId=<id> to discover all tools at once.
+// BUG-MCP2: failures to start or list tools are included in the "warnings" array
+// so the caller can surface them rather than silently receiving a partial tools list.
+func (s *HTTPServer) handleListAllTools(c *gin.Context) {
+	// BUG-MCP-RUNTIME-STALE fix: refresh registered servers from backend before
+	// listing tools so that MCPs created after startup become visible to agents.
+	if s.refresher != nil {
+		s.refresher.Refresh(c.Request.Context())
+	}
+	servers := s.mcpManager.ListServers()
+
+	var allTools []aggregatedTool
+	var warnings []string
+	for _, srv := range servers {
+		client, err := s.mcpManager.GetClient(srv.Name)
+		if err != nil {
+			msg := fmt.Sprintf("MCP server %q: not registered (%v)", srv.Name, err)
+			log.Printf("handleListAllTools: %s", msg)
+			warnings = append(warnings, msg)
+			continue
+		}
+
+		// Auto-start if not yet running so the first request triggers the handshake.
+		if !client.IsRunning() {
+			ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+			startErr := client.Start(ctx)
+			cancel()
+			if startErr != nil {
+				msg := fmt.Sprintf("MCP server %q: failed to start (%v)", srv.Name, startErr)
+				log.Printf("handleListAllTools: %s", msg)
+				warnings = append(warnings, msg)
+				continue
+			}
+		}
+
+		if !client.IsRunning() {
+			msg := fmt.Sprintf("MCP server %q: not running after start attempt", srv.Name)
+			log.Printf("handleListAllTools: %s", msg)
+			warnings = append(warnings, msg)
+			continue
+		}
+
+		result, err := client.ListTools(c.Request.Context())
+		if err != nil {
+			msg := fmt.Sprintf("MCP server %q: failed to list tools (%v)", srv.Name, err)
+			log.Printf("handleListAllTools: %s", msg)
+			warnings = append(warnings, msg)
+			continue
+		}
+
+		for _, tool := range result.Tools {
+			allTools = append(allTools, aggregatedTool{
+				ServerName:  srv.Name,
+				Name:        tool.Name,
+				Description: tool.Description,
+				InputSchema: tool.InputSchema,
+			})
+		}
+	}
+
+	if allTools == nil {
+		allTools = []aggregatedTool{}
+	}
+	if warnings == nil {
+		warnings = []string{}
+	}
+
+	c.JSON(http.StatusOK, gin.H{"tools": allTools, "warnings": warnings})
+}
+
+// callAggregatedRequest mirrors callToolRequest in agenthub-api's HTTPMCPClient.
+type callAggregatedRequest struct {
+	ServerName string          `json:"serverName" binding:"required"`
+	ToolName   string          `json:"toolName"   binding:"required"`
+	Input      json.RawMessage `json:"input"`
+}
+
+// handleCallAggregatedTool routes POST /api/tools/call to the correct MCP server.
+// Response: {"output": <content>, "isError": bool}
+func (s *HTTPServer) handleCallAggregatedTool(c *gin.Context) {
+	var req callAggregatedRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	client, err := s.mcpManager.GetClient(req.ServerName)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("server %q not found", req.ServerName)})
+		return
+	}
+
+	if !client.IsRunning() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		startErr := client.Start(ctx)
+		cancel()
+		if startErr != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to start server: %v", startErr)})
+			return
+		}
+	}
+
+	// Unmarshal input JSON into map for the MCP CallTool interface.
+	var arguments map[string]interface{}
+	if len(req.Input) > 0 && string(req.Input) != "null" {
+		if err := json.Unmarshal(req.Input, &arguments); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("invalid input JSON: %v", err)})
+			return
+		}
+	}
+
+	result, err := client.CallTool(c.Request.Context(), req.ToolName, arguments)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"output":  result.Content,
+		"isError": result.IsError,
+	})
 }

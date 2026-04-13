@@ -8,7 +8,9 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
+	"time"
 
 	"github.com/agenthub/mcp-client-runtime/internal/api"
 	"github.com/agenthub/mcp-client-runtime/internal/backend"
@@ -95,7 +97,12 @@ func main() {
 	log.Println("MCP Manager criado")
 
 	if config.BackendURL != "" {
-		bootstrapConfigs(ctx, config, mcpManager)
+		if ok := bootstrapConfigs(ctx, config, mcpManager); !ok {
+			// P-C253-2: if bootstrap failed (e.g. Keycloak unavailable at startup),
+			// start a background retry loop with exponential back-off so the runtime
+			// recovers automatically once the auth service becomes reachable.
+			go retryBootstrap(ctx, config, mcpManager)
+		}
 	} else {
 		log.Println("AGENTHUB_BACKEND_URL não configurado — bootstrap de configurações ignorado")
 	}
@@ -105,7 +112,15 @@ func main() {
 	grpcServer := startGRPCServer(ctx, config.GRPCPort, mcpManager, errChan)
 	defer grpcServer.GracefulStop()
 
-	_ = startHTTPServer(ctx, config.HTTPPort, mcpManager, errChan)
+	// BUG-MCP-RUNTIME-STALE fix: wire a config refresher so handleListAllTools
+	// re-syncs from the backend at most once every 60 s, ensuring MCPs created
+	// after startup become visible to agents without restarting the runtime.
+	var refresher api.ConfigRefresher
+	if config.BackendURL != "" {
+		refresher = newConfigRefresher(config, mcpManager, 60*time.Second)
+	}
+
+	_ = startHTTPServer(ctx, config.HTTPPort, mcpManager, refresher, errChan)
 
 	log.Println("MCP Client Runtime iniciado com sucesso")
 	log.Printf("gRPC server rodando em :%s", config.GRPCPort)
@@ -195,7 +210,8 @@ func buildBackendTokenProvider(ctx context.Context, config *Config) backend.Toke
 
 // bootstrapConfigs loads server configurations from the backend and registers them.
 // Servers with auto_start = true are connected immediately.
-func bootstrapConfigs(ctx context.Context, config *Config, manager *mcp.Manager) {
+// Returns true if configs were loaded successfully, false on any error.
+func bootstrapConfigs(ctx context.Context, config *Config, manager *mcp.Manager) bool {
 	log.Printf("Carregando configurações MCP do backend: %s (tenant=%s)", config.BackendURL, config.TenantID)
 
 	tokenProvider := buildBackendTokenProvider(ctx, config)
@@ -204,7 +220,7 @@ func bootstrapConfigs(ctx context.Context, config *Config, manager *mcp.Manager)
 	configs, err := backendClient.ListConfigs(ctx)
 	if err != nil {
 		log.Printf("Aviso: falha ao carregar configurações MCP do backend: %v", err)
-		return
+		return false
 	}
 
 	log.Printf("Configurações MCP carregadas: %d encontradas", len(configs))
@@ -280,6 +296,34 @@ func bootstrapConfigs(ctx context.Context, config *Config, manager *mcp.Manager)
 			log.Printf("Servidor MCP %q registrado (auto_start=false)", cfg.Name)
 		}
 	}
+	return true
+}
+
+// retryBootstrap retries bootstrapConfigs with exponential back-off until
+// it succeeds or the context is cancelled. Called when the initial bootstrap
+// fails (e.g. Keycloak unavailable at pod startup).
+func retryBootstrap(ctx context.Context, config *Config, manager *mcp.Manager) {
+	delays := []int{10, 30, 60, 120, 300} // seconds
+	for i := 0; ; i++ {
+		delay := delays[len(delays)-1]
+		if i < len(delays) {
+			delay = delays[i]
+		}
+
+		log.Printf("retryBootstrap: aguardando %ds antes de nova tentativa (tentativa %d)...", delay, i+1)
+		select {
+		case <-ctx.Done():
+			log.Printf("retryBootstrap: contexto cancelado, encerrando loop de retry")
+			return
+		case <-time.After(time.Duration(delay) * time.Second):
+		}
+
+		log.Printf("retryBootstrap: tentativa %d de carregar configurações MCP...", i+1)
+		if bootstrapConfigs(ctx, config, manager) {
+			log.Printf("retryBootstrap: configurações MCP carregadas com sucesso na tentativa %d", i+1)
+			return
+		}
+	}
 }
 
 // buildEnvSlice converts a map of environment variables to KEY=VALUE slice format.
@@ -292,6 +336,44 @@ func buildEnvSlice(env map[string]string) []string {
 		result = append(result, fmt.Sprintf("%s=%s", k, v))
 	}
 	return result
+}
+
+// configRefresher implements api.ConfigRefresher by re-running bootstrapConfigs with a
+// minimum interval between calls so that newly-created MCP server configs are picked up
+// without hammering the backend on every handleListAllTools request.
+//
+// BUG-MCP-RUNTIME-STALE fix: the mcp-client-runtime only learns about MCP server configs
+// at startup (bootstrapConfigs). Configs added after startup are invisible to agents until
+// the runtime restarts. This refresher fills that gap by lazily re-syncing configs.
+type configRefresher struct {
+	mu          sync.Mutex
+	lastRefresh time.Time
+	minInterval time.Duration // minimum gap between backend fetches (default: 60s)
+	cfg         *Config
+	manager     *mcp.Manager
+}
+
+func newConfigRefresher(cfg *Config, manager *mcp.Manager, minInterval time.Duration) *configRefresher {
+	return &configRefresher{
+		cfg:         cfg,
+		manager:     manager,
+		minInterval: minInterval,
+	}
+}
+
+// Refresh re-bootstraps configs from the backend if minInterval has elapsed since the
+// last successful refresh. Concurrent calls are serialised — the second caller waits for
+// the first and then skips its own fetch because the interval resets.
+func (r *configRefresher) Refresh(ctx context.Context) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if time.Since(r.lastRefresh) < r.minInterval {
+		return
+	}
+	log.Printf("configRefresher: re-syncing MCP server configs from backend (last refresh: %s ago)",
+		time.Since(r.lastRefresh).Truncate(time.Second))
+	bootstrapConfigs(ctx, r.cfg, r.manager)
+	r.lastRefresh = time.Now()
 }
 
 // startGRPCServer starts the gRPC server in a goroutine and returns it.
@@ -328,11 +410,16 @@ func startGRPCServer(ctx context.Context, port string, manager *mcp.Manager, err
 }
 
 // startHTTPServer starts the HTTP server in a goroutine and returns it.
-func startHTTPServer(ctx context.Context, port string, manager *mcp.Manager, errChan chan<- error) *api.HTTPServer {
+// refresher, when non-nil, is wired into the server so handleListAllTools
+// re-syncs configs from the backend before aggregating tools.
+func startHTTPServer(ctx context.Context, port string, manager *mcp.Manager, refresher api.ConfigRefresher, errChan chan<- error) *api.HTTPServer {
 	portInt := 8080
 	fmt.Sscanf(port, "%d", &portInt)
 
 	httpSrv := api.NewHTTPServer(portInt, manager)
+	if refresher != nil {
+		httpSrv.WithRefresher(refresher)
+	}
 
 	go func() {
 		log.Printf("Iniciando HTTP server na porta %s...", port)
