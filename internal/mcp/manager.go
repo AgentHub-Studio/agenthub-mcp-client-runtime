@@ -113,6 +113,19 @@ func (m *Manager) StopServer(name string) error {
 	return client.Stop()
 }
 
+// RegisteredNames returns the names of every server currently in the manager.
+// Used by the bootstrap reconciler to detect servers that should be removed
+// because they were deleted or disabled in the backend.
+func (m *Manager) RegisteredNames() []string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	names := make([]string, 0, len(m.clients))
+	for name := range m.clients {
+		names = append(names, name)
+	}
+	return names
+}
+
 // GetClient returns an MCP client by name.
 func (m *Manager) GetClient(name string) (ClientIface, error) {
 	m.mu.RLock()

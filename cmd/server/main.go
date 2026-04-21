@@ -225,8 +225,37 @@ func bootstrapConfigs(ctx context.Context, config *Config, manager *mcp.Manager)
 
 	log.Printf("Configurações MCP carregadas: %d encontradas", len(configs))
 
+	// Build the desired set (enabled configs only) for reconciliation.
+	desired := make(map[string]struct{}, len(configs))
+	for _, cfg := range configs {
+		if cfg.Enabled {
+			desired[cfg.Name] = struct{}{}
+		}
+	}
+
+	// Remove servers that are registered but are no longer desired — they
+	// were deleted in the backend or had enabled flipped to false. Without
+	// this step, disabled servers keep receiving traffic until the next
+	// pod restart (BUG-MCP-CACHE-STALE).
+	for _, name := range manager.RegisteredNames() {
+		if _, keep := desired[name]; !keep {
+			if err := manager.UnregisterServer(name); err != nil {
+				log.Printf("Aviso: falha ao desregistrar servidor %q (removido do backend): %v", name, err)
+			} else {
+				log.Printf("Servidor %q desregistrado (não está mais em configs enabled do backend)", name)
+			}
+		}
+	}
+
 	for _, cfg := range configs {
 		if !cfg.Enabled {
+			continue
+		}
+		// Skip servers that are already registered — the RegisterServer call
+		// below would fail with "already registered" and shadow the config
+		// change. For config updates, operators must unregister explicitly
+		// (admin/API) or bounce the runtime pod.
+		if _, alreadyRegistered := manager.GetClient(cfg.Name); alreadyRegistered == nil {
 			continue
 		}
 
