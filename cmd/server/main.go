@@ -19,8 +19,8 @@ import (
 	"github.com/agenthub/mcp-client-runtime/internal/migrate"
 	"github.com/agenthub/mcp-client-runtime/internal/oauth"
 	_ "github.com/jackc/pgx/v5/stdlib"
-	"google.golang.org/grpc/reflection"
 	grpcserver "google.golang.org/grpc"
+	"google.golang.org/grpc/reflection"
 )
 
 // Config holds application configuration loaded from environment variables.
@@ -96,12 +96,14 @@ func main() {
 	mcpManager := mcp.NewManager()
 	log.Println("MCP Manager criado")
 
+	var backendTokenProvider backend.TokenProvider
 	if config.BackendURL != "" {
-		if ok := bootstrapConfigs(ctx, config, mcpManager); !ok {
+		backendTokenProvider = buildBackendTokenProvider(ctx, config)
+		if ok := bootstrapConfigs(ctx, config, mcpManager, backendTokenProvider); !ok {
 			// P-C253-2: if bootstrap failed (e.g. Keycloak unavailable at startup),
 			// start a background retry loop with exponential back-off so the runtime
 			// recovers automatically once the auth service becomes reachable.
-			go retryBootstrap(ctx, config, mcpManager)
+			go retryBootstrap(ctx, config, mcpManager, backendTokenProvider)
 		}
 	} else {
 		log.Println("AGENTHUB_BACKEND_URL não configurado — bootstrap de configurações ignorado")
@@ -117,7 +119,7 @@ func main() {
 	// after startup become visible to agents without restarting the runtime.
 	var refresher api.ConfigRefresher
 	if config.BackendURL != "" {
-		refresher = newConfigRefresher(config, mcpManager, 60*time.Second)
+		refresher = newConfigRefresher(config, mcpManager, backendTokenProvider, 60*time.Second)
 	}
 
 	_ = startHTTPServer(ctx, config.HTTPPort, mcpManager, refresher, errChan)
@@ -211,10 +213,9 @@ func buildBackendTokenProvider(ctx context.Context, config *Config) backend.Toke
 // bootstrapConfigs loads server configurations from the backend and registers them.
 // Servers with auto_start = true are connected immediately.
 // Returns true if configs were loaded successfully, false on any error.
-func bootstrapConfigs(ctx context.Context, config *Config, manager *mcp.Manager) bool {
+func bootstrapConfigs(ctx context.Context, config *Config, manager *mcp.Manager, tokenProvider backend.TokenProvider) bool {
 	log.Printf("Carregando configurações MCP do backend: %s (tenant=%s)", config.BackendURL, config.TenantID)
 
-	tokenProvider := buildBackendTokenProvider(ctx, config)
 	backendClient := backend.NewBackendClient(config.BackendURL, tokenProvider)
 
 	configs, err := backendClient.ListConfigs(ctx)
@@ -331,7 +332,7 @@ func bootstrapConfigs(ctx context.Context, config *Config, manager *mcp.Manager)
 // retryBootstrap retries bootstrapConfigs with exponential back-off until
 // it succeeds or the context is cancelled. Called when the initial bootstrap
 // fails (e.g. Keycloak unavailable at pod startup).
-func retryBootstrap(ctx context.Context, config *Config, manager *mcp.Manager) {
+func retryBootstrap(ctx context.Context, config *Config, manager *mcp.Manager, tokenProvider backend.TokenProvider) {
 	delays := []int{10, 30, 60, 120, 300} // seconds
 	for i := 0; ; i++ {
 		delay := delays[len(delays)-1]
@@ -348,7 +349,7 @@ func retryBootstrap(ctx context.Context, config *Config, manager *mcp.Manager) {
 		}
 
 		log.Printf("retryBootstrap: tentativa %d de carregar configurações MCP...", i+1)
-		if bootstrapConfigs(ctx, config, manager) {
+		if bootstrapConfigs(ctx, config, manager, tokenProvider) {
 			log.Printf("retryBootstrap: configurações MCP carregadas com sucesso na tentativa %d", i+1)
 			return
 		}
@@ -375,18 +376,20 @@ func buildEnvSlice(env map[string]string) []string {
 // at startup (bootstrapConfigs). Configs added after startup are invisible to agents until
 // the runtime restarts. This refresher fills that gap by lazily re-syncing configs.
 type configRefresher struct {
-	mu          sync.Mutex
-	lastRefresh time.Time
-	minInterval time.Duration // minimum gap between backend fetches (default: 60s)
-	cfg         *Config
-	manager     *mcp.Manager
+	mu            sync.Mutex
+	lastRefresh   time.Time
+	minInterval   time.Duration // minimum gap between backend fetches (default: 60s)
+	cfg           *Config
+	manager       *mcp.Manager
+	tokenProvider backend.TokenProvider
 }
 
-func newConfigRefresher(cfg *Config, manager *mcp.Manager, minInterval time.Duration) *configRefresher {
+func newConfigRefresher(cfg *Config, manager *mcp.Manager, tokenProvider backend.TokenProvider, minInterval time.Duration) *configRefresher {
 	return &configRefresher{
-		cfg:         cfg,
-		manager:     manager,
-		minInterval: minInterval,
+		cfg:           cfg,
+		manager:       manager,
+		tokenProvider: tokenProvider,
+		minInterval:   minInterval,
 	}
 }
 
@@ -401,7 +404,7 @@ func (r *configRefresher) Refresh(ctx context.Context) {
 	}
 	log.Printf("configRefresher: re-syncing MCP server configs from backend (last refresh: %s ago)",
 		time.Since(r.lastRefresh).Truncate(time.Second))
-	bootstrapConfigs(ctx, r.cfg, r.manager)
+	bootstrapConfigs(ctx, r.cfg, r.manager, r.tokenProvider)
 	r.lastRefresh = time.Now()
 }
 
